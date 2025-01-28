@@ -1,6 +1,5 @@
 import json
 
-
 def add_args(parser):
     """
     parser : argparse.ArgumentParser
@@ -555,7 +554,34 @@ def add_args(parser):
         "--use_train_pkl", action="store_true", help="Use train dataset generated after splitting original train dataset into train and val datasets",
     )
 
+    parser.add_argument(
+        "--noise_multiplier",
+        type=float,
+        default=7.0,
+        help="Noise multiplier for dp ftrl",
+    )
+
+    parser.add_argument(
+        "--noise_std",
+        type=float,
+        default=1.0,
+        help="Noise std for dp ftrl",
+    )
+
+    parser.add_argument(
+        "--ftrl_clip",
+        type=float,
+        default=2.0,
+        help="Gradient clipping norm for dp ftrl",
+    )
+
+    parser.add_argument(
+        "--ftrl", action="store_true", help="Use DP FTRL Server Optimizer",
+    )
+
     return parser
+
+    
 
 def add_args_test(parser):
     parser.add_argument(

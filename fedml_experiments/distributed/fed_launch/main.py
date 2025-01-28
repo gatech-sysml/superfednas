@@ -95,6 +95,9 @@ def add_args(parser):
 
     parser.add_argument('--client_optimizer', type=str, default='sgd',
                         help='SGD with momentum; adam')
+    
+    parser.add_argument('--client_optimizer', type=str, default='sgd',
+                        help='SGD with momentum; adam')
 
     # parser.add_argument('--wd', help='weight decay parameter;', type=float, default=0.001)
 

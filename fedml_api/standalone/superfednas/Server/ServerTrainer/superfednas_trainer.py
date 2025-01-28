@@ -5,7 +5,11 @@ import copy
 import wandb
 import torch
 from ofa.utils import flops_counter as fp
-
+from collections import OrderedDict
+import gc
+# from fedml_api.dpftrl.dp_ftrl import FTRLM
+from fedml_api.dpftrl.dp_ftrl import DPFTRLMServerOptimizer
+import sys
 
 """
 Notes:
@@ -117,7 +121,15 @@ class FLOFA_Trainer(ABC):
         # Best Model Checkpointing
         self.prev_best = 0.0
         self.best_model_interval = self.args.best_model_freq
-
+        
+        # DP FTRL Tree Aggregators
+        self.client_tree_aggregators = {}
+        # NOTE: Doesn't support client optimizers other than SGD
+        # Default momentum for SGD is 0 so we set momentum to 0
+        server_model_state_dict = self.server_model.get_model_params()
+        self.server_ftrl_optimizer = DPFTRLMServerOptimizer(1, 0, args.noise_std, server_model_state_dict)
+        self.ftrl_state = self.server_ftrl_optimizer.init_state(server_model_state_dict)
+        print("STD DEV", self.ftrl_state.dp_tree_state.value_generator_state)
         # FedDyn alpha and server state
         self.feddyn = self.args.feddyn
         self.feddyn_alpha = args.feddyn_alpha
@@ -226,9 +238,23 @@ class FLOFA_Trainer(ABC):
                 self.train_data_local_num_dict[client_idx],
             )
 
+            client_model_clone = None
+
             client_model = self.server_model.sample_subnet(
                 round_num, client_idx, idx, self.sampler_args
             )
+
+            if self.args.ftrl:
+                client_model_clone = copy.deepcopy(client_model.state_dict())
+
+            #DP FTRL
+            if self.args.client_optimizer == "ftrl" and client_idx in self.client_tree_aggregators:
+                client_model.set_tree_aggregator(self.client_tree_aggregators[client_idx], round_num)
+            
+            if round_num > 0 and round_num % 3 == 0:
+                self.client_tree_aggregators = {}
+
+
             if self.args.dry_run:
                 flops, _ = fp.profile(client_model.model, (1, 3, 32, 32))
                 gflops = flops / 10e8
@@ -281,6 +307,9 @@ class FLOFA_Trainer(ABC):
                 )
 
             updated_cli_model = self.client_trainer.train(cur_lr, local_ep)
+            if self.args.client_optimizer == "ftrl" and client_idx not in self.client_tree_aggregators:
+                self.client_tree_aggregators[client_idx] = updated_cli_model.tree_aggregator
+            
             training_samples.append(self.client_trainer.get_sample_number())
             # Update client state
             if self.feddyn:
@@ -294,7 +323,16 @@ class FLOFA_Trainer(ABC):
                 )
             # move updated client model to cpu
             updated_cli_model.cpu()
+            if self.args.ftrl:
+                updated_cli_dict = updated_cli_model.state_dict()
+                client_delta_dict = OrderedDict()
+                for k in updated_cli_dict.keys():
+                    # Clip gradient by ftrl_clip
+                    client_delta_dict[k] = torch.clamp(updated_cli_dict[k] - client_model_clone[k], -self.args.ftrl_clip, self.args.ftrl_clip)
+                updated_cli_model.set_params(client_delta_dict)
             w_locals.append(updated_cli_model)
+
+            
         # Multiply weight with dataset size proportion to global dataset size
         if self.args.weight_dataset:
             total_training_samples = sum(training_samples)
@@ -317,6 +355,9 @@ class FLOFA_Trainer(ABC):
             )
             return
         supernet_aggregate = self._aggregate(w_locals)
+        if self.args.ftrl:
+            supernet_aggregate, self.ftrl_state = self.server_ftrl_optimizer.model_update(self.ftrl_state, supernet_aggregate, round_num)
+
         self.server_model.set_model_params(supernet_aggregate)
         # FedDyn Server Side model aggregation
         if self.feddyn:
@@ -381,6 +422,18 @@ class FLOFA_Trainer(ABC):
                 self.args.ofa_config,
                 self.args.model,
             )
+        
+        # reset tree aggreggator dict every x rounds (in hopes of curbing memory balloning)
+        if round_num > 0 and round_num % 3 == 0:
+            print(f"/////////////////////////resetting tree aggregators so we dont get killed, ref_count({sys.getrefcount(self.client_tree_aggregators)})/////////////////////////////")
+            for key in list(self.client_tree_aggregators.keys()):
+                del self.client_tree_aggregators[key]
+            
+            self.client_tree_aggregators = {}
+            gc.collect()
+
+        
+            # torch.cuda.empty_cache()
 
     def _local_test_on_all_clients(self, round_idx):
 

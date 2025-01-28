@@ -7,6 +7,7 @@ import torch
 import logging
 from torch import nn
 import torch.nn.functional as F
+# from fedml_api.dpftrl.dp_ftrl import FTRLM
 
 
 class SubnetTrainer(ClientTrainer):
@@ -17,7 +18,7 @@ class SubnetTrainer(ClientTrainer):
 
     def set_alpha(self, alpha):
         self.alpha = alpha
-
+        
     def train(self, lr, local_ep, **kwargs):
         if self.teacher_model is not None:
             self.teacher_model.to(self.device)
@@ -54,10 +55,36 @@ class SubnetTrainer(ClientTrainer):
 
         if self.args.client_optimizer == "sgd":
             optimizer = torch.optim.SGD(model_params, lr=lr, weight_decay=cur_wd,)
+        elif self.args.client_optimizer == "ftrl" :
+            # param_shapes = [p.shape for p in self.client_model.parameters()]
+            param_shapes = []
+            for p in self.client_model.parameters():
+                if p.requires_grad:
+                    param_shapes.append(p.shape)
+            # self.args 
+            # optimizer = FTRLM( # noqa
+            #             device = self.args.device,
+            #             params=model_params,
+            #             model_param_sizes=param_shapes,
+            #             lr=lr,
+            #             momentum=0.9,
+            #             nesterov=True,
+            #             noise_std=(self.args.noise_multiplier / 1000),
+            #             max_grad_norm=self.args.max_norm,
+            #             seed=self.args.init_seed,
+            #             efficient=True,
+            #         )
+            if self.client_model.tree_aggregator != None:
+                optimizer.tree_aggregator = self.client_model.tree_aggregator
+            else:
+                self.client_model.tree_aggregator = optimizer.tree_aggregator
+
         else:
             optimizer = torch.optim.Adam(
                 model_params, lr=lr, weight_decay=cur_wd, amsgrad=True,
             )
+
+  
 
         epoch_loss = []
         for epoch in range(local_ep if local_ep is not None else self.args.epochs):
@@ -144,6 +171,15 @@ class SubnetTrainer(ClientTrainer):
                         self.client_idx, epoch, sum(epoch_loss) / len(epoch_loss),
                     )
                 )
+
+            # reset tree after every epoch to test memory remains in check (it does). No accuracy obtained for this run.
+            # if self.args.client_optimizer == "ftrl" and hasattr(optimizer, 'tree_aggregator'):
+            #     if optimizer.tree_aggregator:
+            #         optimizer.tree_aggregator.tree = []  # Clear the tree
+            #         optimizer.tree_aggregator.step = 1   # Reset step count
+            #         optimizer.tree_aggregator.depth = 0  # Reset depth if needed
+            #         optimizer.tree_aggregator.max_nodes = 1
+            #     torch.cuda.empty_cache()
         if not self.args.use_bn:
             for m in self.client_model.modules():
                 if isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm1d):

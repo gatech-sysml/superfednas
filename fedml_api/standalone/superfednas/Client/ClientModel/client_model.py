@@ -1,3 +1,5 @@
+import gc
+
 class ClientModel:
     def __init__(
         self,
@@ -7,6 +9,7 @@ class ClientModel:
         is_max_net,
         sample_random_subnet=None,
         sample_random_depth_subnet=None,
+        tree_aggregator = None,
         avg_weight=1,
     ):
         self.model = model
@@ -16,12 +19,16 @@ class ClientModel:
         self.avg_weight = avg_weight
         self.sample_random_subnet = sample_random_subnet
         self.sample_random_depth_subnet = sample_random_depth_subnet
-
+        self.tree_aggregator = tree_aggregator
+        
     def get_model(self):
         return self.model
 
     def state_dict(self):
         return self.model.cpu().state_dict()
+
+    def set_params(self, state_dict):
+        self.model.load_state_dict(state_dict)
 
     def to(self, device):
         self.model.to(device)
@@ -29,6 +36,13 @@ class ClientModel:
     def cpu(self):
         self.model = self.model.cpu()
 
+    def set_tree_aggregator(self, tree_aggregator, round_num):
+        # if round_num > 0 and round_num % 3 == 0:
+        #     print("//////Trying to avoid OOM//////")
+        #     self.tree_aggregator = None
+        #     gc.collect()
+        self.tree_aggregator = tree_aggregator
+    
     def train(self):
         self.model.train()
 

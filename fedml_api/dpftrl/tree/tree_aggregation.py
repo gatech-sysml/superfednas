@@ -1,6 +1,5 @@
 import abc
 import collections
-from collections import OrderedDict
 from typing import Any, Callable, Collection, NamedTuple, Optional, Tuple, Union
 
 import torch 
@@ -47,7 +46,7 @@ class GaussianNoiseGenerator(ValueGenerator):
 
     def __init__(self,
                 noise_std: float,
-                weight_shapes: OrderedDict,
+                weight_shapes: Collection[torch.Tensor],
                 seed: Optional[int] = None):
         """Initializes the GaussianNoiseGenerator.
 
@@ -72,7 +71,7 @@ class GaussianNoiseGenerator(ValueGenerator):
             #default seed of 7
             self._seed = 7
         return self._GlobalState(
-            torch.tensor(self._seed, dtype=torch.int64),
+            torch.tensor(self._seed, dtype=torch.int64, shape=(2,)),
             torch.tensor(self._noise_std, dtype=torch.float32))
 
     def next(self, state):
@@ -86,21 +85,21 @@ class GaussianNoiseGenerator(ValueGenerator):
                 is the advanced state (seed+1, noise_std).
         """
         # Flatten the structure of weights
-        flat_structure = {k: spec.shape for k, spec in self._specs.items()}
-        flat_seeds = {k: state.seeds + i for i, k in enumerate(flat_structure.keys())}
+        flat_structure = [spec.shape for spec in self._specs]
+        flat_seeds = [state.seeds + i for i in range(len(flat_structure))]
         
-        # Generate Gaussian [p[]] for each spec using the seeds
+        # Generate Gaussian noise for each spec using the seeds
         def _get_noise(shape, seed):
             generator = torch.Generator()
-            generator.manual_seed(seed.item())
-            return torch.normal(mean=0.0, std=state.stddev.item(), size=shape, generator=generator)
+            generator.manual_seed(seed)
+            return torch.normal(mean=0.0, std=state.stddev, size=shape, generator=generator)
         
         # Map seeds to the weight shapes
-        nest_noise = OrderedDict()
-        for k in flat_structure.keys():
-            nest_noise[k] = _get_noise(flat_structure[k], flat_seeds[k])
-        last_seed = state.seeds + len(flat_structure.keys()) - 1
-        return nest_noise, self._GlobalState(last_seed + 1, state.stddev)
+        nest_noise = [
+            _get_noise(shape, seed) for shape, seed in zip(flat_structure, flat_seeds)
+        ]
+
+        return nest_noise, self._GlobalState(flat_seeds[-1] + 1, state.stddev)
 
     def make_state(self, seeds: torch.Tensor, stddev: torch.Tensor):
         """Returns a new named tuple of (seeds, stddev)."""
@@ -200,36 +199,24 @@ class EfficientTreeAggregator():
             self.value_generator = value_generator
         else:
             self.value_generator = StatelessValueGenerator(value_generator)
-        
+
     def _get_init_state(self, value_generator_state):
-        """
-        Returns initial buffer for `TreeState`.
-
-        Args:
-            value_generator_state: Initial state for the value generator.
-
-        Returns:
-            TreeState: The initial tree state.
-        """
-        # Initialize level_buffer_idx as a tensor
+        """Returns initial buffer for `TreeState`."""
         level_buffer_idx = torch.tensor([0], dtype=torch.int32)
 
-        # Generate the initial values using the value generator
         new_val, value_generator_state = self.value_generator.next(value_generator_state)
 
-        # Initialize level_buffer structure as a list for dynamic size handling
-        if isinstance(new_val, OrderedDict):  # If new_val is a nested structure
-            level_buffer = OrderedDict()
-            for k, v in new_val.items():
-                level_buffer[k] = [v]
-        else:  # If new_val is a simple tensor
-            level_buffer = [torch.tensor(new_val, dtype=torch.float32)]
+        if isinstance(new_val, dict): 
+            level_buffer_structure = {k: [torch.tensor(v, dtype=torch.float32)] for k, v in new_val.items()}
+        else:  
+            level_buffer_structure = [torch.tensor(new_val, dtype=torch.float32)]
 
+        level_buffer = {k: torch.stack(v) for k, v in level_buffer_structure.items()} if isinstance(level_buffer_structure, dict) else torch.stack(level_buffer_structure)
+        
         return TreeState(
             level_buffer=level_buffer,
             level_buffer_idx=level_buffer_idx,
-            value_generator_state=value_generator_state
-        )
+            value_generator_state=value_generator_state)
 
     def init_state(self) -> TreeState:
         """Returns initial `TreeState`.
@@ -258,15 +245,12 @@ class EfficientTreeAggregator():
         level_weights = 1. / (2. - torch.pow(0.5, state.level_buffer_idx.float()))
 
         def _weighted_sum(buffer):
-            weighted_sum = level_weights[0] * buffer[0]
-            for i in range(1, level_weights.shape[0]):
-                weighted_sum += level_weights[i] * buffer[i]
-            return weighted_sum
-        if isinstance(state.level_buffer, OrderedDict):
-            ret_val = OrderedDict()
-            for k, v in state.level_buffer.items():
-                ret_val[k] = _weighted_sum(v)
-            return ret_val
+            expand_shape = [len(level_weights)] + [1] * (buffer.dim() - 1)
+            weighted_buffer = buffer * level_weights.view(*expand_shape)
+            return torch.sum(weighted_buffer, dim=0)
+
+        if isinstance(state.level_buffer, dict):
+            return {k: _weighted_sum(v) for k, v in state.level_buffer.items()}
         else: 
             return _weighted_sum(state.level_buffer)
 
@@ -277,9 +261,8 @@ class EfficientTreeAggregator():
         level_buffer_idx = state.level_buffer_idx
         level_buffer = state.level_buffer
         value_generator_state = state.value_generator_state
-        new_level_buffer = OrderedDict()
-        for k, _ in level_buffer.items():
-            new_level_buffer[k] = []
+
+        new_level_buffer = [torch.zeros_like(buf) for buf in level_buffer]
         new_level_buffer_idx = []
 
         level_idx = 0
@@ -287,22 +270,25 @@ class EfficientTreeAggregator():
 
         while level_idx < len(level_buffer_idx) and level_idx == level_buffer_idx[level_idx]:
             node_value, value_generator_state = self.value_generator.next(value_generator_state)
-            for k in level_buffer.keys():
-                new_value[k] = 0.5 * (level_buffer[k][level_idx] + new_value[k]) + node_value[k]
+            new_value = [
+                0.5 * (level[level_idx] + new_val) + node_val
+                for level, node_val, new_val in zip(level_buffer, node_value, new_value)
+            ]
             level_idx += 1
         write_buffer_idx = 0
         new_level_buffer_idx.append(level_idx)
 
         #do we need to concatenate rather then append to start?
         # Overwrite val at write_buffer_idx in each buffer
-        for k, val in zip(new_level_buffer.keys(), new_value.values()):
-            new_level_buffer[k].append(val)
+        for buf, val in zip(new_level_buffer, new_value):
+            buf[write_buffer_idx] = val
         write_buffer_idx += 1
 
         for idx in range(level_idx, len(level_buffer_idx)):
             new_level_buffer_idx.append(level_buffer_idx[idx])
-            for k in level_buffer.keys():
-                new_level_buffer[k].append(level_buffer[k][idx])
+            for old_buf in level_buffer:
+                new_level_buffer[write_buffer_idx] = old_buf[idx]
+            write_buffer_idx += 1
 
         new_level_buffer_idx = torch.tensor(new_level_buffer_idx, dtype=torch.int32)
         new_state = TreeState(
